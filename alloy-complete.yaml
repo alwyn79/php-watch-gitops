@@ -4,10 +4,6 @@
 # Collects: PHP metrics, MySQL, Apache, K8s logs, Node, Faro
 # ============================================================
 
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: monitoring
 ---
 apiVersion: v1
 kind: ServiceAccount
