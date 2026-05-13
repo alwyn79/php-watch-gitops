@@ -66,4 +66,4 @@ spec:
     - name: metrics
       port: 9117
       targetPort: 9117
-  type: ClusterIP
+  type: NodePort
