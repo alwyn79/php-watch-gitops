@@ -1,0 +1,380 @@
+# ============================================================
+# Grafana Alloy - Complete All-in-One Collector
+# Replaces: OTEL Collector + Prometheus scraping + Loki shipping
+# Collects: PHP metrics, MySQL, Apache, K8s logs, Node, Faro
+# ============================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alloy
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods, namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+  - nonResourceURLs: [/metrics, /metrics/cadvisor]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alloy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: alloy
+subjects:
+  - kind: ServiceAccount
+    name: alloy
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: monitoring
+data:
+  config.alloy: |
+
+    // ── PROMETHEUS REMOTE WRITE ──────────────────────────────────────────────
+    // Send all metrics to Prometheus (or Grafana Cloud)
+    prometheus.remote_write "default" {
+      endpoint {
+        url = "http://prometheus-operated.monitoring.svc.cluster.local:9090/api/v1/write"
+      }
+    }
+
+    // ── LOKI ─────────────────────────────────────────────────────────────────
+    loki.write "default" {
+      endpoint {
+        url = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+      }
+    }
+
+    // ── 1. PHP APP METRICS (metrics.php scrape) ───────────────────────────────
+    prometheus.scrape "php_watch" {
+      targets = [{
+        __address__ = "php-watch.watch-app.svc.cluster.local:80",
+        job         = "php-watch",
+        app         = "php-watch",
+      }]
+      metrics_path     = "/metrics.php"
+      scrape_interval  = "15s"
+      scrape_timeout   = "10s"
+      forward_to       = [prometheus.remote_write.default.receiver]
+    }
+
+    // ── 2. APACHE METRICS (apache-exporter sidecar) ───────────────────────────
+    prometheus.scrape "apache" {
+      targets = [{
+        __address__ = "php-watch.watch-app.svc.cluster.local:9117",
+        job         = "apache",
+        app         = "php-watch",
+      }]
+      metrics_path    = "/metrics"
+      scrape_interval = "15s"
+      forward_to      = [prometheus.remote_write.default.receiver]
+    }
+
+    // ── 3. MYSQL EXPORTER ────────────────────────────────────────────────────
+    prometheus.scrape "mysql" {
+      targets = [{
+        __address__ = "mysql-exporter.watch-app.svc.cluster.local:9104",
+        job         = "mysql",
+        app         = "mysql",
+      }]
+      metrics_path    = "/metrics"
+      scrape_interval = "15s"
+      forward_to      = [prometheus.remote_write.default.receiver]
+    }
+
+    // ── 4. KUBERNETES POD DISCOVERY & METRICS ────────────────────────────────
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    discovery.relabel "pods" {
+      targets = discovery.kubernetes.pods.targets
+      rule {
+        source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_scrape"]
+        regex         = "true"
+        action        = "keep"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_path"]
+        target_label  = "__metrics_path__"
+        regex         = "(.+)"
+      }
+      rule {
+        source_labels = ["__address__", "__meta_kubernetes_pod_annotation_prometheus_io_port"]
+        target_label  = "__address__"
+        regex         = "([^:]+)(?::\\d+)?;(\\d+)"
+        replacement   = "$1:$2"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+    }
+
+    prometheus.scrape "kubernetes_pods" {
+      targets         = discovery.relabel.pods.output
+      scrape_interval = "30s"
+      forward_to      = [prometheus.remote_write.default.receiver]
+    }
+
+    // ── 5. KUBERNETES NODE METRICS (kubelet) ──────────────────────────────────
+    discovery.kubernetes "nodes" {
+      role = "node"
+    }
+
+    prometheus.scrape "kubelet" {
+      targets = discovery.kubernetes.nodes.targets
+      scheme  = "https"
+      tls_config {
+        insecure_skip_verify = true
+      }
+      bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+      metrics_path      = "/metrics"
+      scrape_interval   = "30s"
+      forward_to        = [prometheus.remote_write.default.receiver]
+    }
+
+    prometheus.scrape "cadvisor" {
+      targets = discovery.kubernetes.nodes.targets
+      scheme  = "https"
+      tls_config {
+        insecure_skip_verify = true
+      }
+      bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+      metrics_path      = "/metrics/cadvisor"
+      scrape_interval   = "30s"
+      forward_to        = [prometheus.remote_write.default.receiver]
+    }
+
+    // ── 6. KUBERNETES POD LOGS ────────────────────────────────────────────────
+    discovery.kubernetes "pod_logs" {
+      role = "pod"
+    }
+
+    discovery.relabel "pod_logs" {
+      targets = discovery.kubernetes.pod_logs.targets
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_name"]
+        separator     = "/"
+        target_label  = "job"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+        separator     = "/"
+        target_label  = "__path__"
+        replacement   = "/var/log/pods/*$1/*.log"
+      }
+    }
+
+    loki.source.kubernetes "pod_logs" {
+      targets    = discovery.relabel.pod_logs.output
+      forward_to = [loki.process.pod_logs.receiver]
+    }
+
+    loki.process "pod_logs" {
+      stage.static_labels {
+        values = {
+          cluster = "minikube",
+          env     = "production",
+        }
+      }
+      forward_to = [loki.write.default.receiver]
+    }
+
+    // ── 7. FARO BROWSER LOGS & TRACES ────────────────────────────────────────
+    faro.receiver "browser" {
+      server {
+        listen_address       = "0.0.0.0"
+        listen_port          = 12348
+        cors_allowed_origins = ["*"]
+      }
+      output {
+        logs = [loki.process.faro.receiver]
+      }
+    }
+
+    loki.process "faro" {
+      stage.static_labels {
+        values = {
+          app = "chronos-watch-shop",
+          job = "faro",
+          env = "production",
+        }
+      }
+      forward_to = [loki.write.default.receiver]
+    }
+
+    // ── 8. OTEL RECEIVER (for OTLP push from PHP) ────────────────────────────
+    otelcol.receiver.otlp "default" {
+      grpc {
+        endpoint = "0.0.0.0:4317"
+      }
+      http {
+        endpoint = "0.0.0.0:4318"
+      }
+      output {
+        metrics = [otelcol.exporter.prometheus.default.input]
+        logs    = [otelcol.exporter.loki.default.input]
+      }
+    }
+
+    otelcol.exporter.prometheus "default" {
+      forward_to = [prometheus.remote_write.default.receiver]
+    }
+
+    otelcol.exporter.loki "default" {
+      forward_to = [loki.write.default.receiver]
+    }
+
+    // ── 9. ALLOY SELF METRICS ────────────────────────────────────────────────
+    prometheus.scrape "alloy_self" {
+      targets = [{
+        __address__ = "localhost:12345",
+        job         = "alloy",
+      }]
+      scrape_interval = "30s"
+      forward_to      = [prometheus.remote_write.default.receiver]
+    }
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: alloy
+  namespace: monitoring
+  labels:
+    app: alloy
+spec:
+  selector:
+    matchLabels:
+      app: alloy
+  template:
+    metadata:
+      labels:
+        app: alloy
+    spec:
+      serviceAccountName: alloy
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          effect: NoSchedule
+      containers:
+        - name: alloy
+          image: grafana/alloy:latest
+          args:
+            - run
+            - --server.http.listen-addr=0.0.0.0:12345
+            - --storage.path=/tmp/alloy
+            - /etc/alloy/config.alloy
+          ports:
+            - name: http
+              containerPort: 12345
+            - name: faro
+              containerPort: 12348
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alloy
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+      volumes:
+        - name: config
+          configMap:
+            name: alloy-config
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy
+  namespace: monitoring
+  labels:
+    app: alloy
+spec:
+  selector:
+    app: alloy
+  ports:
+    - name: http
+      port: 12345
+      targetPort: 12345
+      nodePort: 32345
+    - name: faro
+      port: 12348
+      targetPort: 12348
+      nodePort: 32348
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      nodePort: 32317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      nodePort: 32318
+  type: NodePort
